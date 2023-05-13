@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+
+import os
+import re
+import copy
+import shlex
+import argparse
+import subprocess
+import numpy as np
+from itertools import groupby
+from collections import defaultdict
+from Bio import AlignIO
+import matplotlib.ticker as ticker
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+
+def read_mhg(mhg_path):
+    # Input a mhg path, Output a mhg list in the same format as converted WGA mhg list
+    mhg_string_list = open(mhg_path).read().split('\n')[:-1]
+    return [mhg.split(',') for mhg in mhg_string_list]
+
+def cactus_sibelia_maf_reformat(cactus_maf_path, cactus_or_sibelia):
+    # Convert input maf alignment to mhg format
+    maf_align = AlignIO.parse(cactus_maf_path, "maf")
+    reformatted_mhg_list = []
+    for multiple_alignment in maf_align:
+        if cactus_or_sibelia == 'cactus' and len([*multiple_alignment]) < 3:
+                continue
+        elif cactus_or_sibelia == 'sibelia' and len([*multiple_alignment]) < 2:
+                continue
+        
+        block_list = []
+        for seqrec in multiple_alignment:            
+            if seqrec.id.startswith('Anc'):
+                continue
+                
+            seqId = seqrec.id
+            if cactus_or_sibelia == 'cactus':
+                acc = seqId[seqId.find('.')+1:]
+            elif cactus_or_sibelia == 'sibelia':
+                acc = seqId
+            
+            direction = seqrec.annotations["strand"]
+            if direction == 1:
+                start = seqrec.annotations["start"]
+                align_length = seqrec.annotations["size"]
+                end = start + align_length
+                block_list.append(f"{acc}|{start}|{end}|+")
+            else: 
+                contig_length = seqrec.annotations["srcSize"]
+                rev_start = seqrec.annotations["start"]
+                align_length = seqrec.annotations["size"]
+                end = contig_length - rev_start
+                start = end - align_length
+                block_list.append(f"{acc}|{start}|{end}|-")
+        reformatted_mhg_list.append(block_list)
+    return reformatted_mhg_list
+
+def mauve_maf_reformat(mauve_path):
+    xmfa_align = AlignIO.parse(mauve_path, "mauve")
+    reformatted_mhg_list = []
+    for multiple_alignment in xmfa_align:
+        if len([*multiple_alignment]) < 2:
+               continue
+        block_list = []
+        for seqrec in multiple_alignment:
+            seqId = seqrec.id
+            seqId = seqId[:seqId.find('.fasta')]
+            acc = seqId[::-1]
+            acc = acc[:acc.find('/')][::-1]
+            start = seqrec.annotations["start"]
+            end = seqrec.annotations["end"]
+            direction = seqrec.annotations["strand"]
+            if start == end:
+                continue
+            if direction == 1:
+                block_list.append(f"{acc}|{start}|{end}|+")
+            else:
+                block_list.append(f"{acc}|{start}|{end}|-")
+            
+        reformatted_mhg_list.append(block_list)
+    return reformatted_mhg_list
+
+
+def read_input_alignment(alignment_path, alignment_type):
+    if alignment_type == 'mhg':
+        return read_mhg(alignment_path)
+    elif alignment_type == 'mauve':
+        return mauve_maf_reformat(alignment_path)
+    elif alignment_type == 'cactus':
+        return cactus_sibelia_maf_reformat(alignment_path, 'cactus')
+    elif alignment_type == 'sibeliaz':
+        return cactus_sibelia_maf_reformat(alignment_path, 'sibelia')
+    else:
+        raise Exception("Input alignment type is invalid")
+
+def read_fasta_write_bed(fna_dir, genome_bed):
+    # Input a directory, read file ending with 'fa', 'fna', 'fasta' 
+    # as a dictionary/write to a temp file sotring the coordinate
+    
+    accDic = {}
+    for file in os.listdir(fna_dir):
+        is_fasta = file.endswith('.fa') or file.endswith('.fna') or file.endswith('.fasta')
+        if not is_fasta:
+            continue
+        fasta_path = os.path.join(fna_dir, file)
+        fasta_name = file[:file.find('.')] if '.' in file else file
+        fasta_name = re.sub(r"_","",fasta_name)
+        seqFile = open(fasta_path)
+        lines = (x[1] for x in groupby(seqFile, lambda line: line[0] == ">"))
+        for seqName in lines:
+            seqName = seqName.__next__()[1:].strip()
+            seq = "".join(s.strip() for s in lines.__next__())
+            if seqName.find(" ")!= -1:
+                seqName = seqName[:seqName.find(" ")]
+            accDic[seqName] = seq
+            
+    f = open(genome_bed, 'w')
+    for seqName in sorted(accDic):
+        f.write(f"{seqName}\t{len(accDic[seqName])}\n")
+    f.close()
+    return accDic
+
+def bedtool_complement_mhg(mhg_list, genome_bed_path, mhg_bed_dest, tag):
+    # Input a mhg_list, bedtool complement with genome_bed_path, write all mhgs to mhg_bed_dest
+    # Return a new mhg_list containing original mhg and single-block mhgs, and dictionary for each block to its tag
+    
+    # Write and sort current mhg output
+    f = open(mhg_bed_dest,'w')
+    for block_l in mhg_list:
+        for block in block_l:
+            f.write('\t'.join(block[:-2].split('|'))+'\n')
+    f.close()
+    f_sorted = f"sorted_{mhg_bed_dest}"
+    os.system(f"bedtools sort -i {mhg_bed_dest} > {f_sorted}")
+    
+    # Complement with genome to get single-block mhg
+    single_block_mhg_l = []
+    command = f'bedtools complement -i {f_sorted} -g {genome_bed_path}'
+    process = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE)
+    output, error = process.communicate()
+    entryList = str(output, 'utf-8').split('\n')[:-1]
+    for line in entryList:
+        line = line.split('\t')
+        acc = line[0]
+        start = line[1] if line[1] != '0' else '1'
+        end = line[2]
+        if int(end)-int(start) < 2:
+            continue
+        single_block_mhg_l.append([f"{acc}|{start}|{end}|+"])
+        
+    # Write pangenome mhgs and sort 
+    pan_mhg_list = mhg_list + single_block_mhg_l
+    f = open(mhg_bed_dest, 'a')
+    f.write('\n'.join(['\t'.join(mhg[0].split('|')[:-1]) for mhg in single_block_mhg_l]))
+    f.close()
+    os.system(f"bedtools sort -i {mhg_bed_dest} > {f_sorted}")
+    
+#     pan_mhg_list = mhg_list
+    
+    # Map each block to a unique mhg tag
+    block_tag_dict = dict()
+    for i,block_l in enumerate(pan_mhg_list):
+        for block in block_l:
+            block_tag_dict[block[:-2]] = f"{tag}_{i}"
+    return pan_mhg_list, block_tag_dict
+
+def blockDict2lengthDict(block_tag_dict):
+    length_dict = defaultdict(lambda: [0,0])
+    # length_dict: key is mhg tag, val is a list, 1st index is how many blocks is in the mhg, 
+    # 2nd index is how long is the mhg in total
+    for block in block_tag_dict:
+        start, end = int(block.split('|')[1]), int(block.split('|')[2])
+        length_dict[block_tag_dict[block]][0] += 1
+        length_dict[block_tag_dict[block]][1] += end - start + 1
+    return length_dict
+
+def fractionalization(a_bed_path, b_bed_path, a_block_tag_dict, b_block_tag_dict, a_mhg_stat_dict, b_mhg_stat_dict):
+    a_coverage_dict = defaultdict(lambda: defaultdict(int))
+    b_coverage_dict = defaultdict(lambda: defaultdict(int))
+    a_mhg_length_dict, b_mhg_length_dict = copy.deepcopy(a_mhg_stat_dict), copy.deepcopy(b_mhg_stat_dict)
+    command = 'bedtools intersect -a '+a_bed_path+' -b '+b_bed_path+' -wo'
+    process = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE)
+    output, error = process.communicate()
+    entryList = str(output, 'utf-8').split('\n')[:-1]
+    for line in entryList:
+        line = line.split('\t')
+        block_a = f"{line[0]}|{line[1]}|{line[2]}"
+        block_b = f"{line[3]}|{line[4]}|{line[5]}"
+        overlap_length = int(line[6]) + 1
+        if overlap_length == 1:
+            continue
+        a_mhg = a_block_tag_dict[block_a]
+        b_mhg = b_block_tag_dict[block_b]
+        a_coverage_dict[a_mhg][b_mhg] += overlap_length 
+        b_coverage_dict[b_mhg][a_mhg] += overlap_length
+    
+    a_mhg_l = list(a_mhg_length_dict)
+    for a_mhg in a_mhg_l:
+        block_cnt, total_length = a_mhg_length_dict[a_mhg][0], a_mhg_length_dict[a_mhg][1]
+        fractionalization = 1
+        for overlapped_b_mhg in list(a_coverage_dict[a_mhg]):
+            fractionalization -= pow(a_coverage_dict[a_mhg][overlapped_b_mhg]/total_length, 2)
+        a_mhg_length_dict[a_mhg].append(fractionalization)
+    
+    b_mhg_l = list(b_mhg_length_dict)
+    for b_mhg in b_mhg_l:
+        block_cnt, total_length = b_mhg_length_dict[b_mhg][0], b_mhg_length_dict[b_mhg][1]
+        fractionalization = 1
+        for overlapped_a_mhg in list(b_coverage_dict[b_mhg]):
+            fractionalization -= pow(b_coverage_dict[b_mhg][overlapped_a_mhg]/total_length, 2)
+        b_mhg_length_dict[b_mhg].append(fractionalization)
+    
+    return a_mhg_length_dict, b_mhg_length_dict, a_coverage_dict, b_coverage_dict
+                        
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Fractionalization Calculation to Compare Two Whole Genome Alignment Results')
+    required = parser.add_argument_group('required arguments')
+    optional = parser.add_argument_group('optional arguments')
+    parser.add_argument("-g","--genome",type=str, required = True, help="A directory of input fasta genomes for whole genome aligners, will read in all files ended with '.fna', '.fa', '.fasta'")
+    parser.add_argument("-a","--alignmentA",type=str, required = True, help="Path to the 1st alignment file")
+    parser.add_argument("-b","--alignmentB",type=str, required = True, help="Path to the 2nd alignment file")
+    parser.add_argument("-at","--AType",choices=['mhg','mauve','cactus','sibeliaz'], required = True,
+                        help="File format of the 1st alignment file; 'txt' for mhg/mhg-evo; 'xmfa' for mauve; 'maf' for cactus/sibeliaz")
+    parser.add_argument("-bt","--BType",choices=['mhg','mauve','cactus','sibeliaz'], required = True,
+                        help="File format of the 2nd alignment file; 'txt' for mhg/mhg-evo; 'xmfa' for mauve; 'maf' for cactus/sibeliaz")
+    parser.add_argument("-gb","--genome_bed_output",type=str, default='genome.bed',
+                        help="Output path for genome bed file recording all contig length, default to 'genome.bed'")
+    parser.add_argument("-pa","--prefixA",type=str, default='A',
+                        help="Prefix for the 1st alignment file, default is 'A'")
+    parser.add_argument("-pb","--prefixB",type=str, default='B',
+                        help="Prefix for the 2nd alignment file, default is 'B'")
+    args = parser.parse_args()
+    var_dict = vars(args)
+
+    genome_dir = var_dict['genome']
+    a_path = var_dict['alignmentA']
+    b_path = var_dict['alignmentB']
+    a_type = var_dict['AType']
+    b_type = var_dict['BType']
+    genome_bed = var_dict['genome_bed_output']
+    prefix_a = var_dict['prefixA']
+    prefix_b = var_dict['prefixB']
+                        
+    sim_genome_dict = read_fasta_write_bed(genome_dir, genome_bed)
+    a_mhg_list = read_input_alignment(a_path, a_type)
+    b_mhg_list = read_input_alignment(b_path, b_type)
+    a_bed_output = f"{prefix_a}.bed"
+    b_bed_output = f"{prefix_b}.bed"
+    a_pan_mhg_list, a_block_tag_dict = bedtool_complement_mhg(a_mhg_list, genome_bed, a_bed_output, prefix_a)
+    b_pan_mhg_list, b_block_tag_dict = bedtool_complement_mhg(b_mhg_list, genome_bed, b_bed_output, prefix_b)
+    a_mhg_length_dict = blockDict2lengthDict(a_block_tag_dict)
+    b_mhg_length_dict = blockDict2lengthDict(b_block_tag_dict)
+    a_frac_dict, b_frac_dict, a_coverage_dict, b_coverage_dict = fractionalization(a_bed_output, b_bed_output, a_block_tag_dict, b_block_tag_dict, a_mhg_length_dict, b_mhg_length_dict)
+
+    f1 = open(f"{prefix_a}.tsv",'w')
+    f1.write(f"seqCnt\tavgLength\tfracVal\n")
+    for k in a_frac_dict:
+        block_cnt = a_frac_dict[k][0]
+        avg_length = round(a_frac_dict[k][1]/a_frac_dict[k][0])
+        frac_val = a_frac_dict[k][2]
+        f1.write(f"{block_cnt}\t{avg_length}\t{round(frac_val,3)}\n")
+    f1.close()
+
+    f2 = open(f"{prefix_b}.tsv",'w')
+    f2.write(f"seqCnt\tavgLength\tfracVal\n")
+    for k in b_frac_dict:
+        block_cnt = b_frac_dict[k][0]
+        avg_length = round(b_frac_dict[k][1]/b_frac_dict[k][0])
+        frac_val = b_frac_dict[k][2]
+        f2.write(f"{block_cnt}\t{avg_length}\t{round(frac_val,3)}\n")
+    f2.close()
+
+    fig, axs = plt.subplots(1, 2, figsize=[12,4])
+    bins = list(np.arange(-0.1,1.1,0.1))
+
+    a_mhg_frac_l = [a_frac_dict[k][2] for k in a_frac_dict]
+    axs[0].hist(a_mhg_frac_l, bins=bins, color='steelblue',edgecolor='black', align='mid')
+    axs[0].set_xlabel('Fractionalization Value',fontsize = 13)
+    axs[0].set_ylabel(f"{prefix_a} Alignment Percentage",fontsize = 13)
+    axs[0].spines['top'].set_visible(False)
+    axs[0].spines['right'].set_visible(False)
+    axs[0].spines['left'].set_visible(False)
+    axs[0].set_xlim([-0.1,1.1])
+    axs[0].set_ylim([0, len(a_mhg_frac_l)])
+    axs[0].set_yticks(ticks=np.arange(0.0, len(a_mhg_frac_l)+1, 0.2 * len(a_mhg_frac_l)))
+    axs[0].yaxis.set_major_formatter(ticker.PercentFormatter(xmax=len(a_mhg_frac_l)))
+
+    b_msa_frac_l = [b_frac_dict[k][2] for k in b_frac_dict]
+    axs[1].hist(b_msa_frac_l, bins=bins, color='steelblue',edgecolor='black', align='mid')
+    axs[1].set_xlabel('Fractionalization Value',fontsize = 13)
+    axs[1].set_ylabel(f"{prefix_b} Alignment Percentage",fontsize = 13)
+    axs[1].spines['top'].set_visible(False)
+    axs[1].spines['right'].set_visible(False)
+    axs[1].spines['left'].set_visible(False)
+    axs[1].set_xlim([-0.1,1.1])
+    axs[1].set_ylim([0, len(b_msa_frac_l)])
+    axs[1].set_yticks(ticks=np.arange(0.0, len(b_msa_frac_l)+1, 0.2 * len(b_msa_frac_l)))
+    axs[1].yaxis.set_major_formatter(ticker.PercentFormatter(xmax=len(b_msa_frac_l)))
+    plt.savefig("frac_distribution.png",dpi = 400)
+
+    fig, axs = plt.subplots(1, 2, figsize=[12,4])
+    bins = list(np.arange(-0.1,1.1,0.1))
+
+    a_mhg_x = [a_frac_dict[k][1]/a_frac_dict[k][0] for k in a_frac_dict]
+    a_mhg_y = [a_frac_dict[k][2] for k in a_frac_dict]
+    axs[0].scatter(a_mhg_x, a_mhg_y, s = 5, color = 'steelblue', alpha=0.4)
+    axs[0].set_xlabel(f"{prefix_a} Alignment Length in bp",fontsize = 13)
+    axs[0].set_ylabel('Fractionalization Value',fontsize = 12)
+    # ax.set_title('Module: 16 Internal Node Correlation Frequency',fontsize = 14)
+    axs[0].spines['top'].set_visible(False)
+    axs[0].spines['right'].set_visible(False)
+    axs[0].spines['left'].set_visible(False)
+    axs[0].set_ylim([-0.05,1.05])
+
+    b_msa_x = [b_frac_dict[k][1]/b_frac_dict[k][0] for k in b_frac_dict]
+    b_msa_y = [b_frac_dict[k][2] for k in b_frac_dict]
+    axs[1].scatter(b_msa_x, b_msa_y, s = 5, color = 'steelblue', alpha=0.4)
+    axs[1].set_xlabel(f"{prefix_b} Alignment Length in bp",fontsize = 13)
+    axs[1].set_ylabel('Fractionalization Value',fontsize = 12)
+    # ax.set_title('Module: 16 Internal Node Correlation Frequency',fontsize = 14)
+    axs[1].spines['top'].set_visible(False)
+    axs[1].spines['right'].set_visible(False)
+    axs[1].spines['left'].set_visible(False)
+    axs[1].set_ylim([-0.05,1.05])
+    plt.savefig("alignment_length_vs_frac.png",dpi = 400)                        
+                        
