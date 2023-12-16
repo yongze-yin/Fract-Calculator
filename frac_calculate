@@ -201,6 +201,8 @@ def fractionalization(a_bed_path, b_bed_path, a_block_tag_dict, b_block_tag_dict
         fractionalization = 1
         for overlapped_b_mhg in list(a_coverage_dict[a_mhg]):
             fractionalization -= pow(a_coverage_dict[a_mhg][overlapped_b_mhg]/total_length, 2)
+        # If MHGs contain overlapping regions, fractionalization value will be 0, not a negative value
+        fractionalization = max(0, fractionalization)
         a_mhg_length_dict[a_mhg].append(fractionalization)
     
     b_mhg_l = list(b_mhg_length_dict)
@@ -209,6 +211,8 @@ def fractionalization(a_bed_path, b_bed_path, a_block_tag_dict, b_block_tag_dict
         fractionalization = 1
         for overlapped_a_mhg in list(b_coverage_dict[b_mhg]):
             fractionalization -= pow(b_coverage_dict[b_mhg][overlapped_a_mhg]/total_length, 2)
+        # If MHGs contain overlapping regions, fractionalization value will be 0, not a negative value
+        fractionalization = max(0, fractionalization)
         b_mhg_length_dict[b_mhg].append(fractionalization)
     
     return a_mhg_length_dict, b_mhg_length_dict, a_coverage_dict, b_coverage_dict
