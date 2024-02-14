@@ -10,9 +10,6 @@ import numpy as np
 from itertools import groupby
 from collections import defaultdict
 from Bio import AlignIO
-import matplotlib.ticker as ticker
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mtick
 
 def read_mhg(mhg_path):
     # Input a mhg path, Output a mhg list in the same format as converted WGA mhg list
@@ -165,15 +162,25 @@ def bedtool_complement_mhg(mhg_list, genome_bed_path, mhg_bed_dest, tag):
             block_tag_dict[block[:-2]] = f"{tag}_{i}"
     return pan_mhg_list, block_tag_dict
 
-def blockDict2lengthDict(block_tag_dict):
-    length_dict = defaultdict(lambda: [0,0])
-    # length_dict: key is mhg tag, val is a list, 1st index is how many blocks is in the mhg, 
+def blockDict2lengthDict(block_tag_dict, length_threshold):
+    mhg_index_length_dict = defaultdict(lambda: [0,0])
+    # mhg_index_length_dict: key is mhg tag, val is a list, 1st index is how many blocks is in the mhg, 
     # 2nd index is how long is the mhg in total
+    # If an MHG is shorter than the length_threshold, do not consider it
     for block in block_tag_dict:
         start, end = int(block.split('|')[1]), int(block.split('|')[2])
-        length_dict[block_tag_dict[block]][0] += 1
-        length_dict[block_tag_dict[block]][1] += end - start + 1
-    return length_dict
+        mhg_index_length_dict[block_tag_dict[block]][0] += 1
+        mhg_index_length_dict[block_tag_dict[block]][1] += end - start + 1
+        
+    pop_keys = set()
+    for mhg_i in mhg_index_length_dict:
+        stat_l = mhg_index_length_dict[mhg_i]
+        if stat_l[1] / stat_l[0] < length_threshold:
+            pop_keys.add(mhg_i)
+    
+    for popper_short_i in list(pop_keys):
+        mhg_index_length_dict.pop(popper_short_i, None)
+    return mhg_index_length_dict
 
 def fractionalization(a_bed_path, b_bed_path, a_block_tag_dict, b_block_tag_dict, a_mhg_stat_dict, b_mhg_stat_dict):
     a_coverage_dict = defaultdict(lambda: defaultdict(int))
@@ -234,6 +241,8 @@ if __name__ == "__main__":
                         help="Prefix for the 1st alignment file, default is 'A'")
     parser.add_argument("-pb","--prefixB",type=str, default='B',
                         help="Prefix for the 2nd alignment file, default is 'B'")
+    parser.add_argument("-t","--threshold",type=int, default=60,
+                        help="If an alignment is shorter than the threshold, its fractionalization value will not be reported to avoid an over-representation for the total fractionalization values being too high or too low. If it is needed to consider all alignments no matter for those being short, set this value to 0")
     args = parser.parse_args()
     var_dict = vars(args)
 
@@ -245,6 +254,7 @@ if __name__ == "__main__":
     genome_bed = var_dict['genome_bed_output']
     prefix_a = var_dict['prefixA']
     prefix_b = var_dict['prefixB']
+    length_threshold = var_dict['threshold']
                         
     sim_genome_dict = read_fasta_write_bed(genome_dir, genome_bed)
     a_mhg_list = read_input_alignment(a_path, a_type)
@@ -253,8 +263,8 @@ if __name__ == "__main__":
     b_bed_output = f"{prefix_b}.bed"
     a_pan_mhg_list, a_block_tag_dict = bedtool_complement_mhg(a_mhg_list, genome_bed, a_bed_output, prefix_a)
     b_pan_mhg_list, b_block_tag_dict = bedtool_complement_mhg(b_mhg_list, genome_bed, b_bed_output, prefix_b)
-    a_mhg_length_dict = blockDict2lengthDict(a_block_tag_dict)
-    b_mhg_length_dict = blockDict2lengthDict(b_block_tag_dict)
+    a_mhg_length_dict = blockDict2lengthDict(a_block_tag_dict, length_threshold)
+    b_mhg_length_dict = blockDict2lengthDict(b_block_tag_dict, length_threshold)
     a_frac_dict, b_frac_dict, a_coverage_dict, b_coverage_dict = fractionalization(a_bed_output, b_bed_output, a_block_tag_dict, b_block_tag_dict, a_mhg_length_dict, b_mhg_length_dict)
 
     f1 = open(f"{prefix_a}.tsv",'w')
@@ -274,58 +284,3 @@ if __name__ == "__main__":
         frac_val = b_frac_dict[k][2]
         f2.write(f"{block_cnt}\t{avg_length}\t{round(frac_val,3)}\n")
     f2.close()
-
-    fig, axs = plt.subplots(1, 2, figsize=[12,4])
-    bins = list(np.arange(-0.1,1.1,0.1))
-
-    a_mhg_frac_l = [a_frac_dict[k][2] for k in a_frac_dict]
-    axs[0].hist(a_mhg_frac_l, bins=bins, color='steelblue',edgecolor='black', align='mid')
-    axs[0].set_xlabel('Fractionalization Value',fontsize = 13)
-    axs[0].set_ylabel(f"{prefix_a} Alignment Percentage",fontsize = 13)
-    axs[0].spines['top'].set_visible(False)
-    axs[0].spines['right'].set_visible(False)
-    axs[0].spines['left'].set_visible(False)
-    axs[0].set_xlim([-0.1,1.1])
-    axs[0].set_ylim([0, len(a_mhg_frac_l)])
-    axs[0].set_yticks(ticks=np.arange(0.0, len(a_mhg_frac_l)+1, 0.2 * len(a_mhg_frac_l)))
-    axs[0].yaxis.set_major_formatter(ticker.PercentFormatter(xmax=len(a_mhg_frac_l)))
-
-    b_msa_frac_l = [b_frac_dict[k][2] for k in b_frac_dict]
-    axs[1].hist(b_msa_frac_l, bins=bins, color='steelblue',edgecolor='black', align='mid')
-    axs[1].set_xlabel('Fractionalization Value',fontsize = 13)
-    axs[1].set_ylabel(f"{prefix_b} Alignment Percentage",fontsize = 13)
-    axs[1].spines['top'].set_visible(False)
-    axs[1].spines['right'].set_visible(False)
-    axs[1].spines['left'].set_visible(False)
-    axs[1].set_xlim([-0.1,1.1])
-    axs[1].set_ylim([0, len(b_msa_frac_l)])
-    axs[1].set_yticks(ticks=np.arange(0.0, len(b_msa_frac_l)+1, 0.2 * len(b_msa_frac_l)))
-    axs[1].yaxis.set_major_formatter(ticker.PercentFormatter(xmax=len(b_msa_frac_l)))
-    plt.savefig("frac_distribution.png",dpi = 400)
-
-    fig, axs = plt.subplots(1, 2, figsize=[12,4])
-    bins = list(np.arange(-0.1,1.1,0.1))
-
-    a_mhg_x = [a_frac_dict[k][1]/a_frac_dict[k][0] for k in a_frac_dict]
-    a_mhg_y = [a_frac_dict[k][2] for k in a_frac_dict]
-    axs[0].scatter(a_mhg_x, a_mhg_y, s = 5, color = 'steelblue', alpha=0.4)
-    axs[0].set_xlabel(f"{prefix_a} Alignment Length in bp",fontsize = 13)
-    axs[0].set_ylabel('Fractionalization Value',fontsize = 12)
-    # ax.set_title('Module: 16 Internal Node Correlation Frequency',fontsize = 14)
-    axs[0].spines['top'].set_visible(False)
-    axs[0].spines['right'].set_visible(False)
-    axs[0].spines['left'].set_visible(False)
-    axs[0].set_ylim([-0.05,1.05])
-
-    b_msa_x = [b_frac_dict[k][1]/b_frac_dict[k][0] for k in b_frac_dict]
-    b_msa_y = [b_frac_dict[k][2] for k in b_frac_dict]
-    axs[1].scatter(b_msa_x, b_msa_y, s = 5, color = 'steelblue', alpha=0.4)
-    axs[1].set_xlabel(f"{prefix_b} Alignment Length in bp",fontsize = 13)
-    axs[1].set_ylabel('Fractionalization Value',fontsize = 12)
-    # ax.set_title('Module: 16 Internal Node Correlation Frequency',fontsize = 14)
-    axs[1].spines['top'].set_visible(False)
-    axs[1].spines['right'].set_visible(False)
-    axs[1].spines['left'].set_visible(False)
-    axs[1].set_ylim([-0.05,1.05])
-    plt.savefig("alignment_length_vs_frac.png",dpi = 400)                        
-                        
